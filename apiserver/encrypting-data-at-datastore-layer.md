@@ -1,0 +1,243 @@
+---
+title: Encrypting Data at Datastore Layer
+authors:
+  - "@enj"
+reviewers:
+  - "@sttts"
+  - "@deads2k"
+  - "@p0lyn0mial"
+approvers:
+  - "@sttts"
+  - "@derekwaynecarr"
+  - "@smarterclayton"
+creation-date: 2019-09-09
+last-updated: 2019-09-20
+status: implementable
+see-also:
+  - "/enhancements/etcd/storage-migration-for-etcd-encryption.md"
+---
+
+# Encrypting Data at Datastore Layer
+
+## Release Signoff Checklist
+
+- [ ] Enhancement is `implementable`
+- [ ] Design details are appropriately documented from clear requirements
+- [ ] Test plan is defined
+- [ ] Graduation criteria for dev preview, tech preview, GA
+- [ ] User-facing documentation is created in [openshift/docs]
+
+## Summary
+
+Provide automatic and seamless support for encryption of data stored in etcd while maintaining the principles of OS4 (a self-managed platform that abstracts cluster configuration through intuitive Kubernetes style APIs).
+
+## Motivation
+
+Even in the presence of full disk encryption, users want the ability to encrypt data stored in etcd.  This provides an extra layer of protection against data leakage.  For example, it protects the loss of sensitive secret information if an etcd backup is exposed to the incorrect parties.
+
+### Goals
+
+1. User can enable encryption (globally, with limited config)
+1. The keys used to encrypt are machine generated
+1. The keys used to encrypt are periodically rotated automatically
+1. User can check that encryption is active (coarse view)
+1. User can recover a cluster from etcd backup as long they have the encryption keys
+1. Allow encryption to be disabled once it has been enabled
+1. Encryption at rest should not meaningfully degrade the performance of the cluster
+
+### Non-Goals
+
+1. Allow the user to force key rotation (see test plan section for workarounds for CI)
+1. Support for the Kubernetes KMS envelope encryption
+1. Support for hardware security modules
+1. Allow the user to configure the keys that are used
+1. The user has in-depth understanding of each phase of the encryption process
+
+But, Non-Goals 1, 2 and 3 must be possible as future goals; the design should offer a way to add them at a later stage.
+
+## Proposal
+
+Add a new Encryption field to the `APIServer` config:
+
+```diff
+diff --git a/config/v1/types_apiserver.go b/config/v1/types_apiserver.go
+index ea76aec0..355b25da 100644
+--- a/config/v1/types_apiserver.go
++++ b/config/v1/types_apiserver.go
+@@ -39,6 +39,9 @@ type APIServerSpec struct {
+     // The values are regular expressions that correspond to the Golang regular expression language.
+     // +optional
+     AdditionalCORSAllowedOrigins []string `json:"additionalCORSAllowedOrigins,omitempty"`
++    // encryption allows the configuration of encryption of resources at the datastore layer.
++    // +optional
++    Encryption APIServerEncryption `json:"encryption"`
+ }
+
+ type APIServerServingCerts struct {
+@@ -63,6 +66,38 @@ type APIServerNamedServingCert struct {
+     ServingCertificate SecretNameReference `json:"servingCertificate"`
+ }
+
++type APIServerEncryption struct {
++    // type defines what encryption type should be used to encrypt resources at the datastore layer.
++    // When this field is unset (i.e. when it is set to the empty string), identity is implied.
++    // The behavior of unset can and will change over time.  Even if encryption is enabled by default,
++    // the meaning of unset may change to a different encryption type based on changes in best practices.
++    //
++    // When encryption is enabled, all sensitive resources shipped with the platform are encrypted.
++    // This list of sensitive resources can and will change over time.  The current authoritative list is:
++    //
++    //   1. secrets
++    //   2. config maps
++    //   3. routes
++    //   4. oauth access tokens
++    //   5. oauth authorize tokens
++    //
++    // +unionDiscriminator
++    // +optional
++    Type EncryptionType `json:"type,omitempty"`
++}
++
++type EncryptionType string
++
++const (
++    // identity refers to a type where no encryption is performed at the datastore layer.
++    // Resources are written as-is without encryption.
++    EncryptionTypeIdentity EncryptionType = "identity"
++
++    // aescbc refers to a type where AES-CBC with PKCS#7 padding and a 32-byte key
++    // is used to perform encryption at the datastore layer.
++    EncryptionTypeAESCBC EncryptionType = "aescbc"
++)
++
+ type APIServerStatus struct {
+ }
+```
+
+The default value of empty string for the type will imply `identity` (meaning no encryption of the datastore layer).
+
+The kube api server operator and openshift api server operator will observe this config and begin encrypting sensitive resources when it is set.  The operators are responsible for determining what resources to encrypt.
+
+### User Stories
+
+#### Story 1
+
+User enables encryption by setting `apiserver.spec.encryption.type` to `aescbc`.  After some time passes, user makes a backup of etcd.  The user confirms that the secret values are encrypted by checking to see if they have the `k8s:enc:aescbc:v1:` prefix.
+
+### Implementation Details/Notes/Constraints
+
+Key management is per resources (GroupResources). Different resources that are encrypted have different keys. Keys per resource are numbered with strict increasing unsigned integers. Different resources can have different or overlapping key numbers at the same time.
+
+etcd encryption keys are created and stored in secrets, by convention they are named as:
+
+    <component>-<group>-<resource>-encryption-<unsigned integer #>
+
+with the mandatory and authoritative labels:
+
+- `encryption.operator.openshift.io/component`
+- `encryption.operator.openshift.io/group`
+- `encryption.operator.openshift.io/resource`
+
+##### Key Life Cycle
+
+A key known to the cluster is in one of the following states:
+
+1. **created** - the key secret is created
+1. **read-key** - all API servers have observed and configured the key as a read key
+1. **write-key** - all API servers have observed and configured the key as a write key
+1. **migrated** - since the key has been write-key, all key-values in etcd have been rewritten (=migrated)
+1. **deleted** - all API servers have removed the key as read key
+
+They go through 1-4 via these transitions:
+
+- 1 -> 2: the key is deployed via new API server revisions rolled out to all master nodes.
+- 2 -> 3: the key is deployed via new API server revisions rolled out to all master nodes.
+- 3 -> 4: a migration mechanism rewrites all key-values in etcd.
+
+After another key has been migrated to, i.e. reaches 4, an old key can be decommissioned:
+- 4 -> 5: the old key secret in the cluster is deleted and asynchronously all API servers are updated on the master nodes (no need to wait for that to finish as the read-key is not used anymore after 4).
+
+##### Resources
+
+This list of resources is not configurable.  The following resources are encrypted:
+
+1. secrets
+1. config maps
+1. routes
+1. oauth access tokens
+1. oauth authorize tokens
+
+##### Controllers
+
+The encryption key rotation logic will be implemented using a distributed state machine with a series of controllers that each perform a single, _simple_ task:
+
+1. A controller that looks at all keys in use and generates a single complete encryption config secret in `openshift-config-managed` (this matches the encryption config file format used in upstream)
+1. Sync logic to copy the complete config into the operand’s namespace (this extra indirection allows us to keep unrecoverable key data in an immortal namespace)
+1. A config observer that blindly uses the complete encryption config from the operand’s namespace as the `--encryption-provider-config` (as a persistent file on disk on the node file system)
+1. A controller that generates new encryption keys as needed (based on time - once a **week** is the proposed rotation interval) in `openshift-config-managed`. These secrets have the naming scheme `<component>-<group>-<resource>-encryption-<unsigned integer #>` as defined earlier.
+1. A controller that marks keys as observed at read/write based on the actual config the api server is using.  When all API servers are on a stable revision, it finds the matching complete encryption config secret for that revision.  It then traces each of the keys used in that config back to the matching secrets in `openshift-config-managed`.  Based on how the key is being used in the config (read/write), it updates the matching secrets with the appropriate annotation.
+1. A controller that deletes old encryption keys from `openshift-config-managed` as needed (to prevent old keys from building up)
+1. A controller that runs storage migration for new write keys (this is what actually causes data to be encrypted under a given write key).  This migration only runs when all API servers are on the same revision to prevent writing of data to etcd with a key that is not observed by all servers.
+
+### Risks and Mitigations
+
+1. Deletion of an in-use encryption key will permanently break a cluster
+    - Keys are stored in `openshift-config-managed` which is an immortal namespace
+    - Keys require a two phase delete via a finalizer
+1. Encrypting a large number of resources may cause a high number of rollouts
+    - Controller #1 above does not update the single complete secret during rollouts of the API server.  This causes it to collapse the addition of many new keys into a smaller set of changes.
+1. We wish to use the upstream alpha migration controller to perform storage migration
+    - It may not be ready for use in product environments
+    - In case it proves to be unreliable, we have simple chunking based migration embedded in the operator via a controller
+
+## Design Details
+
+### Test Plan
+
+1. Unit tests for all controllers
+1. Unit tests for encryption config and state transition logic
+1. No integration tests
+1. New e2e suite in the operators to exercise rotation (will be a very slow suite with long timeout of three hours).  The operator's `unsupportedConfigOverrides` field will support a new `encryption` stanza that will allow forcing of rotation for testing purposes.  Setting this field will prevent upgrades (un-setting it after the fact will _not_ allow upgrades).
+1. Encryption will be enabled by default in CI for `e2e-aws` (this will only exercise the off to on state)
+1. QE will be asked to always have encryption enabled in all test clusters, especially long-lived clusters
+1. The OpenShift Online environments will always run with encryption enabled
+
+### Graduation Criteria
+
+##### This feature will GA in 4.3 as long as:
+
+1. Thorough end to end tests, especially around key rotation
+1. Thorough unit tests around various invariants required to keep rotation working
+1. Docs around verification of encryption and disaster recovery
+
+### Upgrade / Downgrade Strategy
+
+1. Downgrade
+    - We may backport the encryption config observer to 4.2.  This would allow a downgrade to 4.2 if encryption had been enabled in 4.3.  The keys would be static since none of the other controllers would be present.
+    - Downgrading from say, 4.4 to 4.3 may be an issue if new encrypted resources are added in 4.4.  Some of the group resource validation done by the controllers could be relaxed to accommodate this.
+1. Upgrade
+    - The addition of new encrypted resources is explicitly handled by the controllers (this logic is used on the first run).
+
+### Version Skew Strategy
+
+1. The controllers constantly handle revision skews between masters as part of their regular operation (and this has the same properties as an upgrade)
+    - New keys go through a read and then write phase to prevent a new master from encrypting data in a way that an old master cannot decrypt
+    - Storage migrations are not performed when there is a revision skew between masters
+
+## Implementation History
+
+1. [Original MVP](https://docs.google.com/document/d/16GGIgacLtmCJIgQrxjfItAt15EAuR6IxtO-vqIBoSwE)
+
+## Drawbacks
+
+1. Adds significant complexity to core operators
+1. Complicates disaster recovery and backups
+1. Possible performance impacts
+
+## Alternatives
+
+1. Skipping this enchantment and instead going straight to KMS - difficult to do because it is hard to support KMS universally whereas the file based approach will always work
+
+## Infrastructure Needed
+
+1. Some configuration or extra tooling may be required to enable encryption by default in `e2e-aws`
