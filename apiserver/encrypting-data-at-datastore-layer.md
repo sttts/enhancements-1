@@ -88,10 +88,10 @@ index ea76aec0..355b25da 100644
 +    // This list of sensitive resources can and will change over time.  The current authoritative list is:
 +    //
 +    //   1. secrets
-+    //   2. config maps
-+    //   3. routes
-+    //   4. oauth access tokens
-+    //   5. oauth authorize tokens
++    //   2. configmaps
++    //   3. routes.route.openshift.io
++    //   4. oauthaccesstokens.oauth.openshift.io
++    //   5. oauthauthorizetokens.oauth.openshift.io
 +    //
 +    // +unionDiscriminator
 +    // +optional
@@ -114,9 +114,9 @@ index ea76aec0..355b25da 100644
  }
 ```
 
-The default value of empty string for the type will imply `identity` (meaning no encryption of the datastore layer).
+The default value of empty string for the type will imply `identity` (meaning no encryption of the datastore layer).  This may change in a future release.
 
-The kube api server operator and openshift api server operator will observe this config and begin encrypting sensitive resources when it is set.  The operators are responsible for determining what resources to encrypt.
+The kube-apiserver operator and openshift-apiserver operator will observe this config and begin encrypting sensitive resources when it is set.  These operators are responsible for determining what resources to encrypt.
 
 ### User Stories
 
@@ -126,7 +126,7 @@ User enables encryption by setting `apiserver.spec.encryption.type` to `aescbc`.
 
 ### Implementation Details/Notes/Constraints
 
-Key management is per resources (GroupResources). Different resources that are encrypted have different keys. Keys per resource are numbered with strict increasing unsigned integers. Different resources can have different or overlapping key numbers at the same time.
+Key management is per `GroupResource`. Different resources that are encrypted have different keys. Keys per resource are numbered with strict increasing unsigned integers. Different resources can have different or overlapping key numbers at the same time.
 
 etcd encryption keys are created and stored in secrets, by convention they are named as:
 
@@ -134,9 +134,19 @@ etcd encryption keys are created and stored in secrets, by convention they are n
 
 with the mandatory and authoritative labels:
 
-- `encryption.operator.openshift.io/component`
-- `encryption.operator.openshift.io/group`
-- `encryption.operator.openshift.io/resource`
+- `encryption.apiserver.operator.openshift.io/component`
+- `encryption.apiserver.operator.openshift.io/group`
+- `encryption.apiserver.operator.openshift.io/resource`
+
+and annotations to track the current state of the secret (explained further below):
+
+- `encryption.apiserver.operator.openshift.io/read-timestamp`
+- `encryption.apiserver.operator.openshift.io/write-timestamp`
+- `encryption.apiserver.operator.openshift.io/migrated-timestamp`
+
+and a finalizer to force a two-phase delete (explained further below):
+
+`encryption.apiserver.operator.openshift.io/deletion-protection`
 
 ##### Key Life Cycle
 
@@ -161,29 +171,61 @@ After another key has been migrated to, i.e. reaches 4, an old key can be decomm
 
 This list of resources is not configurable.  The following resources are encrypted:
 
-1. secrets
-1. config maps
-1. routes
-1. oauth access tokens
-1. oauth authorize tokens
+kube-apiserver:
+
+1. `secrets`
+1. `configmaps`
+
+openshift-apiserver:
+
+1. `routes.route.openshift.io` (routes can contain embedded TLS private keys)
+1. `oauthaccesstokens.oauth.openshift.io`
+1. `oauthauthorizetokens.oauth.openshift.io`
 
 ##### Controllers
 
 The encryption key rotation logic will be implemented using a distributed state machine with a series of controllers that each perform a single, _simple_ task:
 
-1. A controller that looks at all keys in use and generates a single complete encryption config secret in `openshift-config-managed` (this matches the encryption config file format used in upstream)
-1. Sync logic to copy the complete config into the operand’s namespace (this extra indirection allows us to keep unrecoverable key data in an immortal namespace)
+1. A controller that looks at all keys in use and generates a single complete encryption config secret in `openshift-config-managed` (this matches the encryption config file format used in upstream).  See the section below for a description on how this config is built.
+1. Sync logic to copy the complete config into the operand’s namespace (this extra indirection allows us to keep unrecoverable key data in the `openshift-config-managed` immortal namespace)
 1. A config observer that blindly uses the complete encryption config from the operand’s namespace as the `--encryption-provider-config` (as a persistent file on disk on the node file system)
 1. A controller that generates new encryption keys as needed (based on time - once a **week** is the proposed rotation interval) in `openshift-config-managed`. These secrets have the naming scheme `<component>-<group>-<resource>-encryption-<unsigned integer #>` as defined earlier.
-1. A controller that marks keys as observed at read/write based on the actual config the api server is using.  When all API servers are on a stable revision, it finds the matching complete encryption config secret for that revision.  It then traces each of the keys used in that config back to the matching secrets in `openshift-config-managed`.  Based on how the key is being used in the config (read/write), it updates the matching secrets with the appropriate annotation.
-1. A controller that deletes old encryption keys from `openshift-config-managed` as needed (to prevent old keys from building up)
-1. A controller that runs storage migration for new write keys (this is what actually causes data to be encrypted under a given write key).  This migration only runs when all API servers are on the same revision to prevent writing of data to etcd with a key that is not observed by all servers.
+1. A controller that marks keys as observed at read/write based on the actual config the api server is using.  When all API servers are on a stable revision, it finds the matching complete encryption config secret for that revision.  It then traces each of the keys used in that config back to the matching secrets in `openshift-config-managed`.  Based on how the key is being used in the config (read/write), it updates the matching secrets with the appropriate timestamp annotation (set to the current time).
+1. A controller that deletes old encryption keys from `openshift-config-managed` as needed (to prevent old keys from building up).  It first removes the `encryption.apiserver.operator.openshift.io/deletion-protection` finalizer and then removes the secret itself.  Thus if a user accidentally runs a command like `oc delete secret --all -n openshift-config-managed`, it will not result in the cluster becoming permanently inaccessible.
+1. A controller that runs storage migration for new write keys (this is what actually causes data to be encrypted under a given write key).  This migration only runs when all API servers are on the same revision to prevent writing of data to etcd with a key that is not observed by all servers.  After the migration is complete, the migration timestamp annotation is set to the current time.
+
+##### Building the EncryptionConfiguration object
+
+The process for building the `EncryptionConfiguration` object is straightforward, though it does involve a number of steps.
+
+1. List all secrets that match the operator's `encryption.apiserver.operator.openshift.io/component` label
+1. Sort them to have ascending key numbers
+1. Iterate over the sorted list and build the current state for each `GroupResource`
+
+State per `GroupResource`:
+
+1. The mapping of secret to actual encryption key
+1. The mapping of actual encryption key to secret
+1. The read, write and migrated state of each secret
+1. The last secret to be migrated
+
+Translation of each `GroupResource`'s state to individual `ResourceConfiguration`s within the complete `EncryptionConfiguration`:
+
+1. Determine the desired write key by iterating over the ordered secrets and short-circuiting on the first matching criteria
+    - If there is a secret with the write-key annotation but not the migrated annotation, it is the desired write key
+    - If there is a secret with the read-key annotation but not the write-key annotation, it is the desired write key
+    - If present, use the last secret to be migrated as the desired write key
+1. Treat all other keys as read keys
+    - Iterate in reverse to order the read keys with highest key number first
+    - If the last secret to be migrated is encountered, short-circuit as all remaining read keys are no longer needed
+1. Use the write key as the first provider and the read keys as later providers in the list of `ProviderConfiguration`s
+1. If there is no write key, use the `IdentityConfiguration` as the first provider, otherwise use it as the last provider
 
 ### Risks and Mitigations
 
 1. Deletion of an in-use encryption key will permanently break a cluster
     - Keys are stored in `openshift-config-managed` which is an immortal namespace
-    - Keys require a two phase delete via a finalizer
+    - Keys require a two-phase delete via a finalizer as mentioned above
 1. Encrypting a large number of resources may cause a high number of rollouts
     - Controller #1 above does not update the single complete secret during rollouts of the API server.  This causes it to collapse the addition of many new keys into a smaller set of changes.
 1. We wish to use the upstream alpha migration controller to perform storage migration
