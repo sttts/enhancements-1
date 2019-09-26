@@ -218,6 +218,8 @@ The `encryptionKeyController` implements the `->1` transition. It
 - **computes** a new, desired encryption config from `encryption-config-<revision>` and the existing keys in `openshift-config-managed`. 
 - **derives** from the desired encryption config whether a new key is needed. It then creates it.
 
+Note: the `based on time` reason for a new key is based on `encryption.operator.openshift.io/migrated-timestamp` instead of the key secret's `creationTimestamp` because the clock is supposed to start when a migration has been finished, not when it begins.
+
 ##### encryptionStateController
 
 The `encryptionStateController` controller implements transitions `1->2`, `2-3`, and `4-5` (does it????). It
