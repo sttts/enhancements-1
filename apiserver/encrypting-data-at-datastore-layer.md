@@ -148,7 +148,7 @@ The encryption key rotation logic will be implemented using a distributed state 
 
 The distributed state machine is using the following data:
 
-1. keys named `key-<unisgned integer #>`, stored in `openshift-config-managed/<component>-encryption-<unsigned integer #>` secrets, and found via the label `encryption.operator.openshift.io/component` for the respective component.
+1. keys named `key-<unisgned integer #>`, stored in `openshift-config-managed/<component>-encryption-<unsigned integer #>` secrets, and found via the label `encryption.apiserver.operator.openshift.io/component` for the respective component.
 2. the target encryption configuration stored in the `openshift-config-managed/encryption-config` secret as upstream [`apiserver.config.k8s.io/v1.EncryptionConfig`](https://github.com/kubernetes/kubernetes/blob/49891cc270019245a3d4796e84b33bf36d0bae08/staging/src/k8s.io/apiserver/pkg/apis/config/v1/types.go#L24) type (and synched to `<operand-target-namespace>/encryption-config`).
 3. `revision` label of running API server pods.
 4. the observed encryption configuration stored in the `<operand-target-namespace>/encryption-config-<revision>` secret.
@@ -180,10 +180,13 @@ The life-cycle of a key implemented by the controllers is: 1, 2, 3, 4, 5.
 A transition only takes place when all API servers have converged to the same revision, are running, and hence use the same encryption configuration.
 
 - ->1: a new key secret is created if
+  
   - encryption is being enabled via the API or
   - a new **to-be-encrypted** resource shows up or
   - the `EncryptionType` in the API does not match with the newest existing key or
   - based on time (once a **week** is the proposed rotation interval).
+  
+  We wait until migrations are finished before a new key is created.
 - 1->2: when a new **created** key is found.
 - 2->3: when all API servers have **observed the read-key for resource GR**.
 - 3->4: when all GR instances have been rewritten in etcd and the key is marked as **migrated** for that GR by the migration mechanism.
@@ -201,7 +204,7 @@ A new, desired encryption config is computed from the **created** keys and the o
   - to check whether they converged 
   - and to know to which revision (by extracting the `revision` label).
 - **gets** the `<operand-target-namespace>/encryption-config-<revision>` secret.
-- **gets** the keys in `openshift-config-managed` by matching `encryption.operator.openshift.io/component` label.
+- **gets** the keys in `openshift-config-managed` by matching `encryption.apiserver.operator.openshift.io/component` label.
 
 and then following:
 
@@ -222,11 +225,13 @@ Note: the `based on time` reason for a new key is based on `encryption.operator.
 
 ##### encryptionStateController
 
-The `encryptionStateController` controller implements transitions `1->2`, `2-3`, and `4-5` (does it????). It
+The `encryptionStateController` controller implements transitions `1->2`, `2-3`, and part of `4-5`. It
 
 - **watches** pods and secrets in `<operand-target-namespace>` (and is triggered by changes)
 - **computes** a new, desired encryption config from `encryption-config-<revision>` and the existing keys in `openshift-config-managed`. 
 - **applies** the new, desired encryption config to `<operand-target-namespace>/encryption-config` if it differs.
+
+Note: by the shared code to compute the desired configuration, the applied config drops old, unused read-keys after migration has finished (part of transition `4-5`).
 
 ##### encryptionMigrationController
 
@@ -243,12 +248,10 @@ The `encryptionMigrationController` controller implements transition `3-4`. It
 
 ##### encryptionPruneController
 
-`encryptionPruneController` prevents an unbounded growth of old encryption keys.
-For a given resource, if there are more than ten keys which have been migrated,
-this controller will delete the oldest migrated keys until there are ten migrated
-keys total.  These keys are safe to delete since no data in etcd is encrypted using
-them.  Keeping a small number of old keys around is meant to help facilitate
-decryption of old backups (and general precaution).
+The `encryptionPruneController` controller implements transition `4-5`. It
+- **watches** pods and secrets in `<operand-target-namespace>` (and is triggered by changes)
+- **reads** the current encryption config and lists existing key secrets.
+- **deletes** key secrets of keys that are not used anymore in the encryption config.
 
 #### Resources
 
@@ -265,11 +268,15 @@ openshift-apiserver:
 1. `oauthaccesstokens.oauth.openshift.io`
 1. `oauthauthorizetokens.oauth.openshift.io`
 
+Note: configmaps don't seem to be security-sensitive, but we know that large users of etcd encryption do encrypt them because separation of sensitive and non-sensitive data is not always easy in practice.
+
 ### Risks and Mitigations
 
 1. Deletion of an in-use encryption key will permanently break a cluster
     - Keys are stored in `openshift-config-managed` which is an immortal namespace
     - Keys require a two-phase delete via a finalizer as mentioned above
+1. On downgrade the list of resources which should be encrypted might shrink. Not configuring formerly encrypted resource would become unreadable.
+    - Resources **encrypted** once, will stay **encrypted** resources, even on downgrade.
 1. We wish to use the upstream alpha migration controller to perform storage migration
     - It may not be ready for use in product environments
     - In case it proves to be unreliable, we have simple chunking based migration embedded in the operator via a controller
