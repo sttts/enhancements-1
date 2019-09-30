@@ -142,14 +142,14 @@ The encryption key rotation logic will be implemented using a distributed state 
   - read-key,
   - write-key, 
   - migrated-key
-  for a given GR in an [`apiserver.config.k8s.io/v1.EncryptionConfig`](https://github.com/kubernetes/kubernetes/blob/49891cc270019245a3d4796e84b33bf36d0bae08/staging/src/k8s.io/apiserver/pkg/apis/config/v1/types.go#L24).
+  for a set of group resources in an [`apiserver.config.k8s.io/v1.EncryptionConfig`](https://github.com/kubernetes/kubernetes/blob/49891cc270019245a3d4796e84b33bf36d0bae08/staging/src/k8s.io/apiserver/pkg/apis/config/v1/types.go#L24).
 
 #### State
 
 The distributed state machine is using the following data:
 
-1. keys stored in `openshift-config-managed/<component>-encryption-<unsigned integer #>` secrets, and found via the label `encryption.operator.openshift.io/component` for the respective component. They are named as `key-<unsigned integer #>`.
-2. the target encryption configuration stored in the `<operand-target-namespace>/encryption-config` secret as upstream [`apiserver.config.k8s.io/v1.EncryptionConfig`](https://github.com/kubernetes/kubernetes/blob/49891cc270019245a3d4796e84b33bf36d0bae08/staging/src/k8s.io/apiserver/pkg/apis/config/v1/types.go#L24) type.
+1. keys named `key-<unisgned integer #>`, stored in `openshift-config-managed/<component>-encryption-<unsigned integer #>` secrets, and found via the label `encryption.operator.openshift.io/component` for the respective component.
+2. the target encryption configuration stored in the `openshift-config-managed/encryption-config` secret as upstream [`apiserver.config.k8s.io/v1.EncryptionConfig`](https://github.com/kubernetes/kubernetes/blob/49891cc270019245a3d4796e84b33bf36d0bae08/staging/src/k8s.io/apiserver/pkg/apis/config/v1/types.go#L24) type (and synched to `<operand-target-namespace>/encryption-config`).
 3. `revision` label of running API server pods.
 4. the observed encryption configuration stored in the `<operand-target-namespace>/encryption-config-<revision>` secret.
 5. the encryption `APIServer` configuration defined above.
@@ -164,7 +164,7 @@ We say that a key `key-<n>` is
 4. **migrated for resource GR** if the key secret `openshift-config-managed/<component>-encryption-<n>`'s annotation `encryption.operator.openshift.io/migrated-resources` lists the GR.
 5. **deleted** - if its secret `openshift-config-managed/<component>-encryption-<n>` is deleted.
 
-Each version of the operator has a fixed list of GRs that a supposed to be encrypted. All other GRs are **non-encrypted** for that operator. We say that such a resource of the former is **encrypted** if it is configured with at least a read-key in the target encryption config, and **to-be-encrypted** if it is not.
+Each version of the operator has a fixed list of GRs that are supposed to be encrypted. All other GRs are **non-encrypted** for that operator. We say that such a resource of the former is **encrypted** if it is configured with at least a read-key in the target encryption config, and **to-be-encrypted** if it is not.
 
 #### Invariants
 
@@ -179,8 +179,8 @@ The life-cycle of a key implemented by the controllers is: 1, 2, 3, 4, 5.
 
 A transition only takes place when all API servers have converged to the same revision, are running, and hence use the same encryption configuration.
 
-- ->1: a new key secret is created if 
-  - encryption is enabled via the API or
+- ->1: a new key secret is created if
+  - encryption is being enabled via the API or
   - a new **to-be-encrypted** resource shows up or
   - the `EncryptionType` in the API does not match with the newest existing key or
   - based on time (once a **week** is the proposed rotation interval).
@@ -197,18 +197,18 @@ The transitions are implemented by a series of controllers which each perform a 
 
 A new, desired encryption config is computed from the **created** keys and the old revision-config `<operand-target-namespace>/encryption-config-<revision>` by
 
-- **gets** all API server pods by the matching `encryption.operator.openshift.io/component` label to
+- **gets** all API server pods by the matching `apiserver=true` label in the target namespace in order
   - to check whether they converged 
-  - and to know to which revision.
+  - and to know to which revision (by extracting the `revision` label).
 - **gets** the `<operand-target-namespace>/encryption-config-<revision>` secret.
 - **gets** the keys in `openshift-config-managed` by matching `encryption.operator.openshift.io/component` label.
 
 and then following:
 
-- if to-be-encrypted GRs are missing in the old config, return desired config with (a) updated read-keys for all existing resources (b) added to-be-encrypted resourcdes with all the read-keys and `identity` for the write key.
+- if to-be-encrypted GRs are missing in the old config, return desired config with (a) updated read-keys for all existing resources (b) added to-be-encrypted resources with all the read-keys and `identity` for the write key.
 - if configured read-keys do not match the **created** keys in the cluster, return desired config with updated read-keys.
 - if a write-key does not match the latest **observed read-key**, return desired config with this latest **observed read-key** as write-key.
-- if the write-key is marked as **migrated** for all **encrypted** resources, return desired config with all other read-keys removed.
+- if the write-key is marked as **migrated** for all **encrypted** and **to-be-encrypted** resources, return desired config with all other read-keys removed.
 
 ##### encryptionKeyController
 
@@ -216,7 +216,7 @@ The `encryptionKeyController` implements the `->1` transition. It
 
 - **watches** pods and secrets in `<operand-target-namespace>` (and is triggered by changes)
 - **computes** a new, desired encryption config from `encryption-config-<revision>` and the existing keys in `openshift-config-managed`. 
-- **derives** from the desired encryption config whether a new key is needed. It then creates it.
+- **derives** from the desired encryption config whether a new key is needed (as described in `->1` above). It then creates it.
 
 Note: the `based on time` reason for a new key is based on `encryption.operator.openshift.io/migrated-timestamp` instead of the key secret's `creationTimestamp` because the clock is supposed to start when a migration has been finished, not when it begins.
 
@@ -270,8 +270,6 @@ openshift-apiserver:
 1. Deletion of an in-use encryption key will permanently break a cluster
     - Keys are stored in `openshift-config-managed` which is an immortal namespace
     - Keys require a two-phase delete via a finalizer as mentioned above
-1. Encrypting a large number of resources may cause a high number of rollouts
-    - Controller #1 above does not update the single complete secret during rollouts of the API server.  This causes it to collapse the addition of many new keys into a smaller set of changes.
 1. We wish to use the upstream alpha migration controller to perform storage migration
     - It may not be ready for use in product environments
     - In case it proves to be unreliable, we have simple chunking based migration embedded in the operator via a controller
