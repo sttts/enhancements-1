@@ -134,9 +134,9 @@ The encryption key rotation logic will be implemented using a distributed state 
   - **non-encrypted** resources
   - **to-be-encrypted** resource: those which should be encrypted, but aren't yet
   - and **encrypted** resources: those which are already configured for encryption, but maybe not fully migrated.
-- keys are actually pairs of `<encryption-function>` and `<encryption-key>`, where the encryption-function will be one of the supported encryption functions from upstream, e.g. `identity`, `aescbc`, and the encryption-key is a corresponding base64 key string.
+- keys are actually pairs of `<encryption-function>` and `<encryption-key>`, where the encryption-function will be one of the supported encryption functions from upstream, e.g. `identity`, `aescbc`, and the encryption-key is a corresponding base64 key string (null key in case of `identity`).
 - keys are eventually the same for all encrypted resources.
-- keys are numbered with a strictly increasing integer.
+- keys are numbered with a strictly increasing, unsigned integer.
 - keys can be 
   - unused, 
   - read-key,
